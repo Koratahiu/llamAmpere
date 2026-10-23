@@ -785,7 +785,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                            ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  ||
                            ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M;
         ggml_type floor_type = GGML_TYPE_COUNT;
-        if (category == tensor_category::ATTENTION_OUTPUT || category == tensor_category::ATTENTION_GATE) {
+        if (category == tensor_category::ATTENTION_OUTPUT || name.find("attn_gate.weight") != std::string::npos) {
             floor_type = k_4_5 ? GGML_TYPE_Q8_0 : low ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
         } else if (name.find("attn_q_a.weight") != std::string::npos || name.find("attn_q_b.weight")      != std::string::npos ||
                    name.find("attn_k_b.weight") != std::string::npos || name.find("attn_kv_a_mqa.weight") != std::string::npos ||
