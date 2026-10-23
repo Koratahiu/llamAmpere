@@ -356,6 +356,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_v_b.weight")         == std::string::npos;
     }
 
+    // raon1: mHC selectors and small RDA gate projections
+    if (arch == LLM_ARCH_RAON1) {
+        quantize &= name.find("hc_")             == std::string::npos;
+        quantize &= name.find("ssm_f_a.weight")  == std::string::npos;
+        quantize &= name.find("ssm_f_b.weight")  == std::string::npos;
+        quantize &= name.find("ssm_beta.weight") == std::string::npos;
+        quantize &= name.find("ssm_rda.weight")  == std::string::npos;
+    }
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
     quantize &= name.find("time_mix_w0.weight") == std::string::npos;
@@ -472,6 +480,10 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     return return_type;
 }
 
+static double bits_per_weight(ggml_type t) {
+    return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
+}
+
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
 static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype, tensor_category category) {
     const std::string name = ggml_get_name(tensor);
@@ -515,6 +527,14 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
     }
 
+    // raon1: at Q6_K and Q8_0, where the floors below do not apply, keep the MLA latent projections at source precision:
+    // quantizing them costs +5.8% mean KL in Q8_0 for 44 MB. --pure and --tensor-type bypass this, as for the floors
+    if (arch == LLM_ARCH_RAON1 && (ftype == LLAMA_FTYPE_MOSTLY_Q6_K || ftype == LLAMA_FTYPE_MOSTLY_Q8_0) && (
+        name.find("attn_kv_a_mqa.weight") != std::string::npos ||
+        name.find("attn_k_b.weight")      != std::string::npos ||
+        name.find("attn_v_b.weight")      != std::string::npos)) {
+        return tensor->type;
+    }
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -544,11 +564,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
         // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
-        const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
-            (category == tensor_category::FFN_UP ||
-             category == tensor_category::FFN_GATE ||
-             category == tensor_category::FFN_DOWN);
-        if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
+        // the archs checked so far; other MLA archs with 3D attn_k_b / attn_v_b (deepseek2, kimi-k3, ...) still send them to MXFP4
+        const bool has_3d_mla = arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_RAON1;
+        const bool is_expert = category == tensor_category::FFN_UP ||
+                               category == tensor_category::FFN_GATE ||
+                               category == tensor_category::FFN_DOWN;
+        if (tensor->ne[2] > 1 && (!has_3d_mla || is_expert)) {
             new_type = GGML_TYPE_MXFP4;
         } else {
             new_type = GGML_TYPE_Q8_0;
@@ -749,6 +770,34 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             new_type = GGML_TYPE_IQ3_XXS;
         }
         ++qs.i_ffn_up;
+    }
+
+    // raon1: the dense attention projections and the shared expert carry most of the low-bit loss, attn_output and attn_gate most of all
+    // only raise to a floor, after the counters above are updated, so the rest of the mixture does not change
+    if (arch == LLM_ARCH_RAON1 && ggml_is_quantized(new_type)) {
+        const bool k_4_5 = ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M ||
+                           ftype == LLAMA_FTYPE_MOSTLY_Q5_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M;
+        // IQ4_XS/NL and the 1-3 bit K and IQ mixtures (not Q2_0, TQ1_0, TQ2_0 or Q1_0)
+        const bool low   = ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL ||
+                           ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S  || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ||
+                           ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S  ||
+                           ftype == LLAMA_FTYPE_MOSTLY_IQ3_M   || ftype == LLAMA_FTYPE_MOSTLY_Q2_K   || ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S ||
+                           ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  ||
+                           ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M;
+        ggml_type floor_type = GGML_TYPE_COUNT;
+        if (category == tensor_category::ATTENTION_OUTPUT || category == tensor_category::ATTENTION_GATE) {
+            floor_type = k_4_5 ? GGML_TYPE_Q8_0 : low ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
+        } else if (name.find("attn_q_a.weight") != std::string::npos || name.find("attn_q_b.weight")      != std::string::npos ||
+                   name.find("attn_k_b.weight") != std::string::npos || name.find("attn_kv_a_mqa.weight") != std::string::npos ||
+                   name.find("attn_v_b.weight") != std::string::npos || name.find("_shexp.weight")        != std::string::npos) {
+            floor_type = k_4_5 || low ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
+        } else if (category == tensor_category::ATTENTION_Q || category == tensor_category::ATTENTION_K ||
+                   category == tensor_category::ATTENTION_V || name.find("ssm_g.weight") != std::string::npos) {
+            floor_type = k_4_5 ? GGML_TYPE_Q6_K : GGML_TYPE_COUNT;
+        }
+        if (floor_type != GGML_TYPE_COUNT && bits_per_weight(new_type) < bits_per_weight(floor_type)) {
+            new_type = floor_type;
+        }
     }
 
     return new_type;
